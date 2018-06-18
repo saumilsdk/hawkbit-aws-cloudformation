@@ -1,0 +1,300 @@
+service: cloud-hawkbit
+
+frameworkVersion: ">=1.1.0 <2.0.0"
+
+plugins:
+
+custom:
+
+provider:
+  name: aws
+  runtime: nodejs8.10
+  stage: test
+  region: us-east-1
+  memorySize: 512
+
+  deploymentBucket:
+    name: cloud-${opt:stage, self:provider.stage}-deployment-artifacts
+
+  iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - s3:*
+        # restrict this at a later point in time
+        Resource: "arn:aws:s3:::*/*"
+      - Effect: Allow
+        # restrict this at a later point in time
+        Action:
+          - es:*
+        Resource: "arn:aws:es:self:provider.region}:*:domain/*"
+      - Effect: Allow
+        # restrict this at a later point in time
+        Action:
+          - logs:PutLogEvents
+        Resource: "arn:aws:logs:self:provider.region}:*:log-group:*:log-stream:*"
+
+functions:
+  # no functions here as of now, any deployment related lambdas to go here
+
+resources:
+  Mappings:
+    # Hard values for the subnet masks. These masks define
+    # the range of internal IP addresses that can be assigned.
+    # The VPC can have all IP's from 10.0.0.0 to 10.0.255.255
+    # There are two subnets which cover the ranges:
+    #
+    # 10.0.0.0 - 10.0.0.255
+    # 10.0.1.0 - 10.0.1.255
+    #
+    # If you need more IP addresses (perhaps you have so many
+    # instances that you run out) then you can customize these
+    # ranges to add more
+    SubnetConfig:
+      VPC:
+        CIDR: '10.0.0.0/16'
+      PublicOne:
+        CIDR: '10.0.0.0/24'
+      PublicTwo:
+        CIDR: '10.0.1.0/24'
+
+  Parameters:
+    HawkbitClusterName:
+      Type: String
+      Description: Name of app requiring ELB exposure
+      Default: hawkbit-cluster
+    HawkbitContainerName:
+      Type: String
+      Description: Name of app requiring ELB exposure
+      Default: hawkbit-container
+    HawkbitContainerPort:
+      Type: Number
+      Description: Container port of app requiring ELB exposure
+      Default: '8080'
+    HawkbitContainerHostPort:
+      Type: Number
+      Description: Host port of app requiring ELB exposure
+      Default: '8080'
+    HawkbitServiceName:
+      Type: String
+      Default: hawkbit-service
+    HawkbitTaskCpu:
+      Type: String
+      Description: CPU allocation for ECS Task in units
+      Default: 1024
+    HawkbitTaskMemory:
+      Type: String
+      Description: Memory allocation for ECS Task in MB
+      Default: 2048
+    HawkbitLoadBalancerName:
+      Type: String
+      Default: hawkbit-load-balancer
+
+  Resources:
+    ECSCloudwatchLogsGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+        LogGroupName: ECSLogGroup
+        RetentionInDays: 14
+    HawkbitECSRole:
+      Type: 'AWS::IAM::Role'
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: "2008-10-17"
+          Statement:
+            - Sid: ''
+              Effect: Allow
+              Principal:
+                Service: "ecs-tasks.amazonaws.com"
+              Action: "sts:AssumeRole"
+        Path: /
+        Policies:
+          - PolicyName: AmazonECSTaskExecutionRolePolicy
+            PolicyDocument:
+              Statement:
+              - Effect: Allow
+                Action:
+                  # Allow the ECS Tasks to download images from ECR
+                  - 'ecr:GetAuthorizationToken'
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchGetImage'
+
+                  # Allow the ECS tasks to upload logs to CloudWatch
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+    HawkbitVPC:
+      Type: 'AWS::EC2::VPC'
+      Properties:
+        CidrBlock: {Fn::FindInMap: ['SubnetConfig', 'VPC', 'CIDR']}
+        Tags:
+          - Key: Name
+            Value: HawkbitVPC
+    HawkbitPublicSubnetOne:
+      Type: AWS::EC2::Subnet
+      Properties:
+        AvailabilityZone:
+           Fn::Select:
+           - 0
+           - Fn::GetAZs: {Ref: 'AWS::Region'}
+        VpcId: {Ref: HawkbitVPC}
+        CidrBlock: {Fn::FindInMap: ['SubnetConfig', 'PublicOne', 'CIDR']}
+        MapPublicIpOnLaunch: true
+        Tags:
+          - Key: Name
+            Value: HawkbitPublicSubnetOne
+    HawkbitPublicSubnetTwo:
+      Type: AWS::EC2::Subnet
+      Properties:
+        AvailabilityZone:
+           Fn::Select:
+           - 1
+           - Fn::GetAZs: {Ref: 'AWS::Region'}
+        VpcId: {Ref: HawkbitVPC}
+        CidrBlock: {Fn::FindInMap: ['SubnetConfig', 'PublicTwo', 'CIDR']}
+        MapPublicIpOnLaunch: true
+        Tags:
+          - Key: Name
+            Value: HawkbitPublicSubnetTwo
+    HawkbitPublicSG:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupName: HawkbitPublicSG
+        GroupDescription: Access to the public facing load balancer
+        VpcId: {Ref: HawkbitVPC}
+        SecurityGroupIngress:
+            # Allow access to ALB from anywhere on the internet
+            - CidrIp: 0.0.0.0/0
+              IpProtocol: -1
+    HawkbitECSCluster:
+      Type: "AWS::ECS::Cluster"
+      Properties:
+        ClusterName: {Ref: HawkbitClusterName}
+    HawkbitStartServerTask:
+      Type: 'AWS::ECS::TaskDefinition'
+      Properties:
+        RequiresCompatibilities:
+          - FARGATE
+        NetworkMode: awsvpc
+        Cpu: {Ref: HawkbitTaskCpu}
+        Memory: {Ref: HawkbitTaskMemory}
+        ExecutionRoleArn: {Ref: HawkbitECSRole}
+        TaskRoleArn: {Ref: HawkbitECSRole}
+        ContainerDefinitions:
+          - Name: {Ref: HawkbitContainerName}
+            Image: hawkbit/hawkbit-update-server
+            Cpu: {Ref: HawkbitTaskCpu}
+            PortMappings:
+              - ContainerPort: {Ref: HawkbitContainerPort}
+                HostPort: {Ref: HawkbitContainerHostPort}
+            Memory: {Ref: HawkbitTaskMemory}
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: {Ref: ECSCloudwatchLogsGroup}
+                awslogs-region: {Ref: 'AWS::Region'}
+                awslogs-stream-prefix: ecs
+            Essential: 'true'
+    HawkbitService:
+      Type: 'AWS::ECS::Service'
+      Properties:
+        Cluster: {Ref: HawkbitECSCluster}
+        LaunchType: FARGATE
+        DeploymentConfiguration:
+          MaximumPercent: 200
+          MinimumHealthyPercent: 0
+        DesiredCount: 1
+        NetworkConfiguration:
+          AwsvpcConfiguration:
+            AssignPublicIp: ENABLED
+            SecurityGroups:
+              - {Ref: HawkbitPublicSG}
+            Subnets:
+              - {Ref: HawkbitPublicSubnetOne}
+              - {Ref: HawkbitPublicSubnetTwo}
+        LoadBalancers:
+          - ContainerName: {Ref: HawkbitContainerName}
+            ContainerPort: {Ref: HawkbitContainerPort}
+            TargetGroupArn: {Ref: HawkbitTargetGroupPublic}
+        TaskDefinition: {Ref: HawkbitStartServerTask}
+        ServiceName: {Ref: HawkbitServiceName}
+      DependsOn:
+        - HawkbitElb
+        - HawkbitStartServerTask
+        - HawkbitPublicSG
+    HawkbitElb:
+      Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+      Properties:
+        Name: {Ref: HawkbitLoadBalancerName}
+        Type: application
+        Scheme: internet-facing
+        LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '30'
+        Subnets:
+          - {Ref: HawkbitPublicSubnetOne}
+          - {Ref: HawkbitPublicSubnetTwo}
+        SecurityGroups: [{Ref: HawkbitPublicSG}]
+      DependsOn: HawkbitGatewayAttachment
+    HawkbitTargetGroupPublic:
+      Type: AWS::ElasticLoadBalancingV2::TargetGroup
+      Properties:
+        HealthCheckIntervalSeconds: 300
+        HealthCheckPath: /
+        HealthCheckProtocol: HTTP
+        HealthCheckTimeoutSeconds: 60
+        HealthyThresholdCount: 2
+        Name: {Ref: HawkbitServiceName}
+        TargetType: ip
+        Port: {Ref: HawkbitContainerHostPort}
+        Protocol: HTTP
+        UnhealthyThresholdCount: 10
+        VpcId: {Ref: HawkbitVPC}
+    PublicLoadBalancerListener:
+      Type: AWS::ElasticLoadBalancingV2::Listener
+      DependsOn:
+        - HawkbitElb
+      Properties:
+        DefaultActions:
+          - TargetGroupArn: {Ref: HawkbitTargetGroupPublic}
+            Type: 'forward'
+        LoadBalancerArn: {Ref: HawkbitElb}
+        Port: {Ref: HawkbitContainerHostPort}
+        Protocol: HTTP
+    HawkbitInternetGateway:
+      Type: 'AWS::EC2::InternetGateway'
+    HawkbitGatewayAttachment:
+      Type: 'AWS::EC2::VPCGatewayAttachment'
+      Properties:
+        InternetGatewayId: {Ref: HawkbitInternetGateway}
+        VpcId: {Ref: HawkbitVPC}
+    HawkbitPublicRouteTable:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId: {Ref: HawkbitVPC}
+        Tags:
+          - Key: Name
+            Value: HawkbitPublicRouteTable
+    HawkbitPublicRoute:
+      Type: AWS::EC2::Route
+      DependsOn: HawkbitGatewayAttachment
+      Properties:
+        RouteTableId: {Ref: HawkbitPublicRouteTable}
+        DestinationCidrBlock: '0.0.0.0/0'
+        GatewayId: {Ref: HawkbitInternetGateway}
+    HawkbitPublicSubnetOneRouteTableAssociation:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId: {Ref: HawkbitPublicSubnetOne}
+        RouteTableId: {Ref: HawkbitPublicRouteTable}
+    HawkbitPublicSubnetTwoRouteTableAssociation:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId: {Ref: HawkbitPublicSubnetTwo}
+        RouteTableId: {Ref: HawkbitPublicRouteTable}
+
+  Outputs:
+    HawkbitLoadBalancerEndPoint:
+      Description: Hawkbit Load Balancer EndPoint
+      Value:
+        Fn::Join: [":", [{Fn::GetAtt: [HawkbitElb, DNSName]}, {Ref: HawkbitContainerHostPort}]]
