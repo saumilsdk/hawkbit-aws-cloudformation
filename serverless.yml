@@ -74,6 +74,10 @@ resources:
       Type: Number
       Description: Host port of app requiring ELB exposure
       Default: '8080'
+    HawkbitElbPort:
+      Type: Number
+      Description: ELB Port for public APIs
+      Default: '80'
     HawkbitServiceName:
       Type: String
       Default: hawkbit-service
@@ -259,7 +263,7 @@ resources:
           - TargetGroupArn: {Ref: HawkbitTargetGroupPublic}
             Type: 'forward'
         LoadBalancerArn: {Ref: HawkbitElb}
-        Port: {Ref: HawkbitContainerHostPort}
+        Port: {Ref: HawkbitElbPort}
         Protocol: HTTP
     HawkbitInternetGateway:
       Type: 'AWS::EC2::InternetGateway'
@@ -297,4 +301,4 @@ resources:
     HawkbitLoadBalancerEndPoint:
       Description: Hawkbit Load Balancer EndPoint
       Value:
-        Fn::Join: [":", [{Fn::GetAtt: [HawkbitElb, DNSName]}, {Ref: HawkbitContainerHostPort}]]
+        Fn::GetAtt: [HawkbitElb, DNSName]
